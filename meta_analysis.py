@@ -57,11 +57,13 @@ def extract_data(articles):
     data = []
     
     # Regex patterns for effect sizes (simplified)
-    # Looking for OR, RR, HR followed by numbers
-    es_pattern = re.compile(r'\b(OR|RR|HR|Odds Ratio|Risk Ratio|Hazard Ratio)\s*[=:]?\s*(\d+\.?\d*)', re.IGNORECASE)
-    # Looking for CI 
-    ci_pattern = re.compile(r'\(\s*(95\s*%\s*CI)?\s*[:=]?\s*(\d+\.?\d*)\s*[-–,]\s*(\d+\.?\d*)\s*\)', re.IGNORECASE)
+    # Expanded regex to capture more formats like "OR=1.2", "OR 1.2", "relative risk of 1.2"
+    es_pattern = re.compile(r'\b(OR|RR|HR|Odds Ratio|Risk Ratio|Hazard Ratio)\b.*?[:=]?\s*(\d+\.\d+)', re.IGNORECASE | re.DOTALL)
+    # CI Pattern: looks for (95% CI: 1.1-2.2) or (1.1, 2.2) or similar variants
+    ci_pattern = re.compile(r'\(\s*(?:95\s*%\s*C\.?I\.?)?\s*[:=]?\s*(\d+\.\d+)\s*[-–,to]\s*(\d+\.\d+)\s*\)', re.IGNORECASE)
     
+    last_abstract_debug = ""
+
     for article in articles:
         try:
             medline = article['MedlineCitation']
@@ -80,13 +82,9 @@ def extract_data(articles):
             # Abstract
             abstract_list = article_data.get('Abstract', {}).get('AbstractText', [])
             abstract = " ".join(abstract_list) if isinstance(abstract_list, list) else str(abstract_list)
-            
+            last_abstract_debug = abstract
+
             # Extract Effect Size (Heuristics)
-            # Expanded regex to capture more formats like "OR=1.2", "OR 1.2", "relative risk of 1.2"
-            es_pattern = re.compile(r'\b(OR|RR|HR|Odds Ratio|Risk Ratio|Hazard Ratio)\b.*?[:=]?\s*(\d+\.\d+)', re.IGNORECASE | re.DOTALL)
-            # CI Pattern: looks for (95% CI: 1.1-2.2) or (1.1, 2.2) or similar variants
-            ci_pattern = re.compile(r'\(\s*(?:95\s*%\s*C\.?I\.?)?\s*[:=]?\s*(\d+\.\d+)\s*[-–,to]\s*(\d+\.\d+)\s*\)', re.IGNORECASE)
-            
             es_match = es_pattern.search(abstract)
             effect_size = None
             es_type = None
@@ -119,8 +117,7 @@ def extract_data(articles):
                         pass
             
             if effect_size:
-                # Basic validation: CI should bracket the ES usually (not always for OR/RR if <1 or >1? No, ES is inside CI)
-                # And Lower < Upper
+                # Basic validation: CI should bracket the ES usually
                 if lower_ci and upper_ci:
                     if lower_ci > upper_ci:
                         lower_ci, upper_ci = upper_ci, lower_ci
@@ -131,23 +128,28 @@ def extract_data(articles):
                     "Effect Type": es_type,
                     "Lower CI": lower_ci,
                     "Upper CI": upper_ci,
-                    "Population": population,
+                    "Population": "General", # Simplification
                     "Authors": authors,
                     "Reference": title
                 }
+                
+                # Attempt Population extraction
+                if "children" in abstract.lower(): row["Population"] = "Children"
+                elif "adults" in abstract.lower(): row["Population"] = "Adults"
+                elif "patients" in abstract.lower(): row["Population"] = "Patients"
+
                 data.append(row)
                 if len(data) <= 1:
                      print(f"DEBUG: Found ES: {effect_size} CI: {lower_ci}-{upper_ci} in {title[:30]}...")
             
-    # Fallback: if no data found, maybe the regex is too strict
-    if not data:
-        print("DEBUG: No data found. Showing snippet of last abstract processed to help debug:")
-        if 'abstract' in locals():
-            print(abstract[:200])
-
-                
         except Exception as e:
             continue
+
+    # Fallback: if no data found
+    if not data:
+        print("DEBUG: No data found. Showing snippet of last abstract processed to help debug:")
+        if last_abstract_debug:
+            print(last_abstract_debug[:200])
             
     return pd.DataFrame(data)
 
