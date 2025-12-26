@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, jsonify, send_from_directory
 import meta_analysis
 import os
+import pandas as pd
 
 # Define absolute paths for templates and static files based on current directory
 try:
@@ -25,8 +26,37 @@ def analyze():
     data = request.json
     disease = data.get('disease', 'Breast Cancer')
     exposure = data.get('exposure', 'Coffee')
+    outcome = data.get('outcome', 'Incidence')
+    exclude_meta = data.get('exclude_meta', False)
     
-    result = meta_analysis.get_analysis_data(disease, exposure)
+    result = meta_analysis.get_analysis_data(disease, exposure, outcome=outcome, exclude_meta=exclude_meta)
+    return jsonify(result)
+
+@app.route('/reanalyze', methods=['POST'])
+def reanalyze():
+    data = request.json
+    studies = data.get('studies', [])
+    disease = data.get('disease', 'Custom Analysis')
+    exposure = data.get('exposure', 'Custom Exposure')
+    
+    if not studies:
+        return jsonify({"error": "No studies provided for analysis."})
+    
+    # Convert list of dicts to DataFrame
+    df = pd.DataFrame(studies)
+    
+    # Ensure numeric columns are floats
+    numeric_cols = ['Effect Size', 'Lower CI', 'Upper CI', 'SE']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+    # Calculate SE if missing (though the frontend should pass it back ideally, 
+    # but we can re-calculate if needed, provided we have CIs)
+    # However, get_analysis_data calculated SE effectively. 
+    # The frontend will send back the full study objects which include 'SE'.
+    
+    result = meta_analysis.perform_meta_analysis(df, disease, exposure)
     return jsonify(result)
 
 @app.route('/static/<path:filename>')

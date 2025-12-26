@@ -13,12 +13,12 @@ import forestplot
 
 # ... (rest of imports)
 
-def get_analysis_data(disease, exposure):
+def get_analysis_data(disease, exposure, outcome="Incidence", exclude_meta=False):
     """
     Main entry point for web app. Returns a dict with results.
     """
-    print(f"Analyzing: {disease} vs {exposure}")
-    ids = search_pubmed(disease, exposure)
+    print(f"Analyzing: {disease} vs {exposure} (Outcome: {outcome}, Exclude Meta/Reviews: {exclude_meta})")
+    ids = search_pubmed(disease, exposure, outcome=outcome, exclude_meta=exclude_meta)
     articles = fetch_details(ids)
     
     df = extract_data(articles)
@@ -32,6 +32,12 @@ def get_analysis_data(disease, exposure):
     if df_clean.empty:
         return {"error": "Effect sizes found but no Confidence Intervals to calculate SE."}
 
+    return perform_meta_analysis(df_clean, disease, exposure)
+
+def perform_meta_analysis(df_clean, disease, exposure):
+    """
+    Performs random-effects meta-analysis on the provided DataFrame.
+    """
     # Meta-Analysis
     # Log transformation logic
     df_clean['log_ES'] = df_clean.apply(lambda x: np.log(x['Effect Size']) if x['Effect Type'] in ['OR', 'RR', 'HR', 'ODDS RATIO', 'RISK RATIO'] and x['Effect Size'] > 0 else x['Effect Size'], axis=1)
@@ -45,111 +51,125 @@ def get_analysis_data(disease, exposure):
     df_clean['var'] = df_clean['log_SE'] ** 2
     
     # Set index to Study for better summary labels
-    # We create a copy or modify appropriate used dataframe
-    # statsmodels uses the index of the input series
-    
-    # Use 'Study' column as index
-    # Resolve duplicates if any (unlikely with "et al" but possible)
-    # We'll just append simple counter if needed, or assume uniqueness for now
+    # Set index to Study for better summary labels
     analysis_df = df_clean.set_index('Study')
     
     try:
-        res = combine_effects(analysis_df['log_ES'], analysis_df['var'], method_re='dl')
-        summary_df = res.summary_frame()
-        
-        # Explicitly update the index of the study rows to match our Study names
-        # The summary frame has N rows (studies) + summary rows
-        n_studies = len(analysis_df)
-        
-        # Create a new index list: Study names + existing summary labels (e.g. fixed effect, random effect)
-        new_index = list(analysis_df.index) + list(summary_df.index[n_studies:])
-        summary_df.index = new_index
-        
-        # Cleanup table columns as per user request
-        # Drop w_fe, w_re
-        cols_to_drop = ['w_fe', 'w_re']
-        # Use errors='ignore' in case they don't exist in some versions
-        summary_df = summary_df.drop(columns=cols_to_drop, errors='ignore')
-        
-        # Rename columns
-        summary_df = summary_df.rename(columns={
-            'eff': 'Effect',
-            'sd_eff': 'SD Effect',
-            'ci_low': '95% CI lower',
-            'ci_upp': '95% CI upper'
-        })
-        
-        # Rename rows as requested
-        summary_df = summary_df.rename(index={
-            'random effect wls': 'Random-effects meta-analysis (WLS)',
-            'fixed effect wls': 'Fixed-effect meta-analysis (WLS)'
-        })
-
-        # Round to 4 decimal places as requested
-        summary_df = summary_df.round(4)
-        
-        # Create a copy for display that excludes the fixed/random effect rows
-        display_df = summary_df.copy()
-        rows_to_drop = ['Fixed-effect meta-analysis (WLS)', 'Random-effects meta-analysis (WLS)']
-        # Also check for the original names in case renaming didn't happen
-        rows_to_drop.extend(['fixed effect wls', 'random effect wls', 'fixed effect', 'random effect'])
-        display_df = display_df.drop(index=[r for r in rows_to_drop if r in display_df.index], errors='ignore')
-        
-        summary = display_df.to_html(classes='table table-striped', header=True)
-        
-        # Extract keys for headline
-        # Depending on version 'random effect' row might be named differently?
-        # In snippet it was "random effect"
-        # We try to grab the row named 'random effect'
-        
-        try:
-             # Handle potential row naming variations
-             if 'Random-effects meta-analysis (WLS)' in summary_df.index:
-                 re_row = summary_df.loc['Random-effects meta-analysis (WLS)']
-             elif 'random effect wls' in summary_df.index:
-                 re_row = summary_df.loc['random effect wls']
-             elif 'random effect' in summary_df.index:
-                 re_row = summary_df.loc['random effect']
-             else:
-                 # It might be the last row
-                 re_row = summary_df.iloc[-1]
+        if len(analysis_df) < 2:
+            # Handle single study case manually
+            summary_df = pd.DataFrame({
+                'Effect': list(analysis_df['log_ES']),
+                '95% CI lower': list(analysis_df['log_ES'] - 1.96 * analysis_df['log_SE']),
+                '95% CI upper': list(analysis_df['log_ES'] + 1.96 * analysis_df['log_SE'])
+            }, index=analysis_df.index)
+            
+            # Add a dummy row for "Pooled" which is just the same study
+            summary_df.loc['Pooled Result (Single Study)'] = summary_df.iloc[0]
+            summary_df = summary_df.round(4)
+            
+            # Simple interpretation for single study
+            log_eff = summary_df.loc['Pooled Result (Single Study)', 'Effect']
+            log_ci_low = summary_df.loc['Pooled Result (Single Study)', '95% CI lower']
+            log_ci_upp = summary_df.loc['Pooled Result (Single Study)', '95% CI upper']
+            
+            pooled_es = np.exp(log_eff)
+            pooled_lower = np.exp(log_ci_low)
+            pooled_upper = np.exp(log_ci_upp)
              
-             # Updated keys after renaming
-             log_eff = re_row['Effect']
-             log_ci_low = re_row['95% CI lower']
-             log_ci_upp = re_row['95% CI upper']
-             
-             # Convert back to linear scale for display (assuming OR/RR)
-             pooled_es = np.exp(log_eff)
-             pooled_lower = np.exp(log_ci_low)
-             pooled_upper = np.exp(log_ci_upp)
-             
-             # Interpretation
-             # Significant if CI does not include 1 (i.e. log CI does not include 0)
-             is_significant = (log_ci_low > 0) or (log_ci_upp < 0)
-             
-             interpretation = "Statistically Significant" if is_significant else "Not Statistically Significant"
-             
-             # Direction
-             if is_significant:
+            is_significant = (log_ci_low > 0) or (log_ci_upp < 0)
+            interpretation = "Statistically Significant" if is_significant else "Not Statistically Significant"
+            if is_significant:
                  direction = "Increased Risk/Odds" if log_eff > 0 else "Decreased Risk/Odds"
                  interpretation += f" ({direction})"
-             
-             headline = {
+            
+            headline = {
                  "pooled_es": float(round(pooled_es, 2)),
                  "ci_low": float(round(pooled_lower, 2)),
                  "ci_upp": float(round(pooled_upper, 2)),
                  "interpretation": interpretation
-             }
+            }
+            
+            summary = summary_df.to_html(classes='table table-striped', header=True)
+            
+        else:
+            res = combine_effects(analysis_df['log_ES'], analysis_df['var'], method_re='dl')
+            summary_df = res.summary_frame()
+            
+            # Explicitly update the index
+            n_studies = len(analysis_df)
+            new_index = list(analysis_df.index) + list(summary_df.index[n_studies:])
+            summary_df.index = new_index
+            
+            # Cleanup table columns
+            cols_to_drop = ['w_fe', 'w_re']
+            summary_df = summary_df.drop(columns=cols_to_drop, errors='ignore')
+            
+            # Rename columns
+            summary_df = summary_df.rename(columns={
+                'eff': 'Effect',
+                'sd_eff': 'SD Effect',
+                'ci_low': '95% CI lower',
+                'ci_upp': '95% CI upper'
+            })
+            
+            # Rename rows
+            summary_df = summary_df.rename(index={
+                'random effect wls': 'Random-effects meta-analysis (WLS)',
+                'fixed effect wls': 'Fixed-effect meta-analysis (WLS)'
+            })
 
-        except Exception as e:
-             print(f"Error parsing summary stats: {e}")
-             headline = None
+            summary_df = summary_df.round(4)
+            
+            # Display DF
+            display_df = summary_df.copy()
+            rows_to_drop = ['Fixed-effect meta-analysis (WLS)', 'Random-effects meta-analysis (WLS)']
+            rows_to_drop.extend(['fixed effect wls', 'random effect wls', 'fixed effect', 'random effect'])
+            display_df = display_df.drop(index=[r for r in rows_to_drop if r in display_df.index], errors='ignore')
+            
+            summary = display_df.to_html(classes='table table-striped', header=True)
+            
+            # Extract Headline
+            try:
+                # Handle potential row naming variations
+                if 'Random-effects meta-analysis (WLS)' in summary_df.index:
+                    re_row = summary_df.loc['Random-effects meta-analysis (WLS)']
+                elif 'random effect wls' in summary_df.index:
+                    re_row = summary_df.loc['random effect wls']
+                elif 'random effect' in summary_df.index:
+                    re_row = summary_df.loc['random effect']
+                else:
+                    re_row = summary_df.iloc[-1]
+            
+                log_eff = re_row['Effect']
+                log_ci_low = re_row['95% CI lower']
+                log_ci_upp = re_row['95% CI upper']
+                
+                pooled_es = np.exp(log_eff)
+                pooled_lower = np.exp(log_ci_low)
+                pooled_upper = np.exp(log_ci_upp)
+                
+                is_significant = (log_ci_low > 0) or (log_ci_upp < 0)
+                
+                interpretation = "Statistically Significant" if is_significant else "Not Statistically Significant"
+                
+                if is_significant:
+                    direction = "Increased Risk/Odds" if log_eff > 0 else "Decreased Risk/Odds"
+                    interpretation += f" ({direction})"
+                
+                headline = {
+                    "pooled_es": float(round(pooled_es, 2)),
+                    "ci_low": float(round(pooled_lower, 2)),
+                    "ci_upp": float(round(pooled_upper, 2)),
+                    "interpretation": interpretation
+                }
+
+            except Exception as e:
+                print(f"Error parsing summary stats: {e}")
+                headline = None
         
         # Plot
         plt.figure(figsize=(10, 6))
 
-        
         fp_df = df_clean.copy()
         fp_df = fp_df.rename(columns={'Study': 'group', 'log_ES': 'est'})
         fp_df['lb'] = fp_df['est'] - 1.96 * fp_df['log_SE']
@@ -170,17 +190,17 @@ def get_analysis_data(disease, exposure):
         if not os.path.exists("static"):
             os.makedirs("static")
         plt.savefig(plot_path, bbox_inches='tight')
-        plt.close() # Close plot to free memory
+        plt.close() 
         
-        # Convert df to records for frontend
-        studies_data = df_clean[['Study', 'Effect Size', 'Lower CI', 'Upper CI', 'Population', 'Reference', 'Authors', 'Journal', 'Year', 'Link']].to_dict(orient='records')
+        # Convert df to records
+        studies_data = df_clean[['Study', 'Effect Size', 'Lower CI', 'Upper CI', 'Population', 'Reference', 'Authors', 'Journal', 'Year', 'Link', 'Effect Type', 'SE']].to_dict(orient='records')
         
         return {
             "success": True,
             "studies": studies_data,
             "summary_html": summary,
             "headline": headline,
-            "plot_url": "static/forest_plot.png?t=" + str(np.random.randint(0,10000)) # cache busting
+            "plot_url": "static/forest_plot.png?t=" + str(np.random.randint(0,10000)) 
         }
         
     except Exception as e:
@@ -199,11 +219,24 @@ load_dotenv('mykey.env')
 # Setup Entrez
 Entrez.email = os.getenv('PUBMED_EMAIL', 'your_email@example.com')
 
-def search_pubmed(disease, exposure, max_results=20):
+def search_pubmed(disease, exposure, outcome="Incidence", exclude_meta=False, max_results=20):
     """
     Search PubMed for articles related to the disease and exposure.
     """
-    query = f"{disease} AND {exposure} AND (Meta-Analysis[ptyp] OR Review[ptyp] OR Clinical Trial[ptyp])"
+    # Define outcome terms
+    if outcome == "Survival":
+        outcome_terms = '(survival OR mortality OR prognosis OR "hazard ratio" OR "death")'
+    else:
+        # Default to Incidence
+        outcome_terms = '(incidence OR risk OR development OR "associated with" OR "odds ratio")'
+
+    if exclude_meta:
+        # Exclude Meta-Analysis and Reviews, prioritize primary studies
+        query = f"{disease} AND {exposure} AND {outcome_terms} AND (Clinical Trial[ptyp] OR Randomized Controlled Trial[ptyp] OR Journal Article[ptyp]) NOT (Meta-Analysis[ptyp] OR Review[ptyp] OR Systematic Review[ptyp])"
+    else:
+        # Original inclusive query
+        query = f"{disease} AND {exposure} AND {outcome_terms} AND (Meta-Analysis[ptyp] OR Review[ptyp] OR Clinical Trial[ptyp] OR Journal Article[ptyp])"
+        
     print(f"Searching PubMed for: {query}")
     
     try:
